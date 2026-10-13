@@ -1,9 +1,25 @@
-from typing import Literal, Tuple, Union, List, Dict, Any
+"""Fragment m/z binning.
+
+Centroided peaks of the same fragment drift by a few ppm from scan to scan, so peaks
+are mapped onto a fixed grid of m/z bins before building scan x bin matrices. Two
+details matter:
+
+- **Right-edge convention.** `_bins` stores the right edge of each bin. A value `v`
+  belongs to the first bin whose right edge is >= `v` (`np.searchsorted`, side
+  "left"), so a value exactly on an edge goes to the lower bin.
+- **Interleaved grids.** With `steps = 2`, a second grid is shifted by half a bin.
+  Every peak is binned on every grid, so a fragment that sits on a bin edge in one
+  grid falls near a bin center in the other. Bins of all grids share one global index
+  space: `global index = step * n_bins + bin`.
+"""
+
+from typing import Literal, Tuple, Union, List, Dict, Any, Optional
 
 import numpy as np
 import h5py
 
 from fragment_feature_detection.config import Config
+from fragment_feature_detection.storage import link_shared_dataset
 
 
 class MzDiscretize:
@@ -58,14 +74,20 @@ class MzDiscretize:
     def bin_left_edge(self) -> np.ndarray:
         """Get the left edge values of all bins.
 
+        The left edge of a bin is the right edge of the previous bin. The first bin's
+        left edge is one bin width below its right edge (a fixed width in Da, or
+        right edge x tolerance in ppm).
+
         Returns:
             np.ndarray: Array of bin left edge values.
         """
+        if self._bin_width == "da":
+            first_left_edge = self._bins[:, 0] - self._tolerance
+        else:
+            first_left_edge = self._bins[:, 0] - self._bins[:, 0] * self._tolerance
         return np.hstack(
             [
-                (self._bins[:, 0] - self._bins[:, 0] * self._tolerance)[
-                    ..., np.newaxis
-                ],
+                first_left_edge[..., np.newaxis],
                 self._bins[:, :-1],
             ],
         )
@@ -83,6 +105,8 @@ class MzDiscretize:
     def bin_indices(self) -> np.ndarray:
         """Get the indices for all bins across all steps.
 
+        Row `i` holds the global indices of grid `i`: `i * n_bins + [0..n_bins)`.
+
         Returns:
             np.ndarray: 2D array of bin indices, shape (steps, bins_per_step).
         """
@@ -97,6 +121,9 @@ class MzDiscretize:
         self, indices: Union[np.ndarray, List[int]], center: bool = False
     ) -> np.ndarray:
         """Convert bin indices to m/z values.
+
+        Works on global indices: flattening the (steps, n_bins) edge array row by row
+        gives exactly the global index order.
 
         Args:
             indices (Union[np.ndarray, List[int]]): Bin indices to convert.
@@ -122,31 +149,41 @@ class MzDiscretize:
 
         Creates bins using either constant dalton width or variable ppm width.
         Bins describe right edge of bin, ties go left by default.
+
+        - "da": grid `i` starts at `mz_low + i * tolerance / steps` and advances by
+          `tolerance`, i.e. each grid is shifted up by 1/steps of a bin.
+        - "ppm": grid `i` starts at `mz_high` shifted down by `i/steps` of a bin, and
+          each edge below is the previous one times (1 - tolerance), so bin width is
+          proportional to m/z. Grids are cut to a common length, keeping the high
+          end, and reversed to ascending order.
+
+        In both cases, bin columns whose right edge is <= mz_low in any grid are
+        dropped, so all grids have the same number of bins.
         """
         if self._bin_width == "da":
-            bins = np.empty(
-                (
-                    self._steps,
-                    np.ceil((self._mz_high - self._mz_low) / self._tolerance).astype(
-                        int
-                    ),
-                )
+            # Build with an explicit count, np.arange lengths can differ by one between
+            # steps due to floating point.
+            n_bins = int(np.ceil((self._mz_high - self._mz_low) / self._tolerance))
+            bins = np.array(
+                [
+                    self._mz_low
+                    + (self._tolerance / self._steps * i)
+                    + self._tolerance * np.arange(n_bins)
+                    for i in range(self._steps)
+                ]
             )
-            for i in range(self._steps):
-                bins[i] = np.arange(
-                    self._mz_low + (self._tolerance / self._steps * i),
-                    self._mz_high + (self._tolerance / self._steps * i),
-                    self._tolerance,
-                )
         elif self._bin_width == "ppm":
             bins = []
             for i in range(self._steps):
+                # Top right edge of grid i, shifted down by i/steps of a bin.
                 b = [
                     self._mz_high - (i * self._tolerance * self._mz_high / self._steps)
                 ]
+                # Walk down in constant-ppm steps until below mz_low.
                 while b[-1] > self._mz_low:
                     b.append(b[-1] - (self._tolerance * b[-1]))
                 bins.append(b)
+            # Same number of bins per grid, ascending order.
             min_b = min([len(b) for b in bins])
             bins = np.array([b[:min_b][::-1] for b in bins])
         # Bins reflect right edge, filter bins < self._mz_low
@@ -158,21 +195,28 @@ class MzDiscretize:
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Discretize an array of m/z values into bins.
 
+        Every value is binned on every grid. Values above the last right edge are
+        clipped into the last bin and values below the first edge land in the first
+        bin; `discretize_mz_array` removes those.
+
         Args:
             m (np.ndarray): Array of m/z values to discretize.
             center (bool): If True, return bin center values instead of right edges. Defaults to False.
 
         Returns:
             Tuple[np.ndarray, np.ndarray]: Tuple containing:
-                - Array of bin indices for each input m/z value
-                - Array of corresponding bin edge or center values
+                - Array of global bin indices for each input m/z value, shape
+                  (steps, n_values)
+                - Array of corresponding bin edge or center values, same shape
         """
+        # Per grid: index of the first right edge >= value.
         row_indices = np.empty((self._steps, m.shape[0]))
         for i in range(self._steps):
             indices = np.searchsorted(self._bins[i], m)
             indices[indices >= self._bins.shape[1]] = self._bins.shape[1] - 1
             # bin_indices[i] = indices + (i * self._bins.shape[1])
             row_indices[i] = indices
+        # Look up the right edge (or center) of each assigned bin.
         if not center:
             bin = self._bins[
                 np.repeat(np.arange(0, self._steps), m.shape[0]),
@@ -185,6 +229,7 @@ class MzDiscretize:
                 row_indices.flatten().astype(int),
             ].reshape(self._steps, -1)
 
+        # Offset grid i's local indices by i * n_bins to get global indices.
         bin_indices = (
             row_indices
             + (np.arange(0, self._bins.shape[0]) * self._bins.shape[1])[..., np.newaxis]
@@ -199,6 +244,11 @@ class MzDiscretize:
     ) -> np.ndarray:
         """Discretize an array containing m/z values and additional information.
 
+        Each input row is emitted once per grid (only for grids whose range contains
+        its m/z), with the global bin index and the bin's right edge appended. For the
+        long MS2 array (7 columns) the output columns are therefore
+        [gpf, scan, rt, mz, intensity, gpf_low, gpf_high, bin_index, bin_right_edge].
+
         Args:
             m (np.ndarray): 2D array where one column contains m/z values.
             sort_m (bool): If True, sort the array by m/z values. Defaults to True.
@@ -206,26 +256,35 @@ class MzDiscretize:
 
         Returns:
             np.ndarray: Discretized array with additional columns for bin indices and edges.
-                       Shape is (n_rows * steps, n_columns + 2).
+                       Up to (n_rows * steps, n_columns + 2) rows, grid by grid.
         """
         if sort_m:
             m = m[np.argsort(m[:, mz_index])]
 
+        # Keep only peaks inside the configured m/z range.
         m = m[(m[:, mz_index] > self._mz_low) & (m[:, mz_index] < self._mz_high)]
 
         bin_indices, bin_right_edge = self.discretize(m[:, mz_index])
 
-        disc_m = np.empty((m.shape[0] * self._steps, m.shape[1] + 2))
+        # discretize clips out-of-range values into the first/last bin, drop them
+        # instead so every value lands in the bin whose edges contain it.
+        bin_left_edge = self.bin_left_edge
+        disc_m = []
         for i in range(self._steps):
-            disc_m[i * m.shape[0] : (i + 1) * m.shape[0]] = np.hstack(
-                [
-                    m,
-                    bin_indices[i][:, np.newaxis],
-                    bin_right_edge[i][:, np.newaxis],
-                ]
+            in_range = (m[:, mz_index] > bin_left_edge[i, 0]) & (
+                m[:, mz_index] <= self._bins[i, -1]
+            )
+            disc_m.append(
+                np.hstack(
+                    [
+                        m[in_range],
+                        bin_indices[i][in_range][:, np.newaxis],
+                        bin_right_edge[i][in_range][:, np.newaxis],
+                    ]
+                )
             )
 
-        return disc_m
+        return np.concatenate(disc_m)
 
     @classmethod
     def from_config(cls, config: Config = Config()) -> "MzDiscretize":
@@ -244,6 +303,8 @@ class MzDiscretize:
         self,
         h5file: Union[str, h5py.File, h5py.Group],
         dataset_name: str = "mz_discretize",
+        shared: bool = False,
+        compression: Optional[str] = None,
     ) -> None:
         """Save the MzDiscretize object to an HDF5 file or group.
 
@@ -268,8 +329,13 @@ class MzDiscretize:
         grp.attrs["steps"] = self._steps
         grp.attrs["tolerance"] = self._tolerance
 
-        # Save bins array
-        grp.create_dataset("bins", data=self._bins)
+        # Save bins array. With shared=True the grid is stored once per file and
+        # hard-linked here, since every GPFRun of a run uses the same grid. Readers
+        # see an ordinary "bins" dataset either way.
+        if shared:
+            link_shared_dataset(grp, "bins", self._bins, compression=compression)
+        else:
+            grp.create_dataset("bins", data=self._bins)
 
         if close_file:
             f.close()
@@ -281,6 +347,9 @@ class MzDiscretize:
         dataset_name: str = "mz_discretize",
     ) -> "MzDiscretize":
         """Load a MzDiscretize object from an HDF5 file or group.
+
+        The stored bin edges replace the rebuilt ones, so indices stay valid even if
+        the bin-building code changes.
 
         Args:
             h5file (Union[str, h5py.File, h5py.Group]): Path to HDF5 file or h5py File/Group object

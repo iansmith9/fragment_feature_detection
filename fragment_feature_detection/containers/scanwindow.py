@@ -1,3 +1,12 @@
+"""ScanWindow: one time tile of one isolation window, the unit that NMF is fit on.
+
+A GPFRun (all MS2 scans of one isolation target) is cut into overlapping tiles of
+``scan_width`` scans. Each tile is a ScanWindow holding a scans x m/z-bins intensity
+matrix plus everything learned about it: the filtered matrix, the NMF factors W/H,
+Gaussian fits of each component's elution, which components survive deduplication,
+attached MS1 features and the MS1-MS2 matching results.
+"""
+
 import copy
 import logging
 import warnings
@@ -9,7 +18,12 @@ import scipy.ndimage as ndi
 import scipy.sparse as sps
 from sklearn.decomposition import NMF
 
-from .ms1feature import MS1Feature
+from ..storage import create_dataset
+from .ms1feature import (
+    MS1Feature,
+    dump_ms1_feature_table,
+    load_ms1_feature_table,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +33,48 @@ class ScanWindow:
 
     This class handles the processing and filtering of mass spectrometry data within a specific scan window,
     including operations like denoising, scaling, and filtering of m/z values.
+
+    Lifecycle (the order the pipeline calls things in):
+
+    1. Built by ``GPFRun.slice_scan_window`` from rows ``[start, start + scan_width)``
+       of the GPF's sparse scans x bins matrix.
+    2. ``filter_scans`` cleans the matrix (drops bins, scales, denoises).
+    3. ``set_nmf_fit`` stores the NMF factors: ``_w`` (scans x components, elution
+       profiles) and ``_h`` (components x kept bins, spectra).
+    4. ``set_peak_fits`` stores a Gaussian (mean, sigma, error) per component and drops
+       components that failed to fit or sit at the clipped edges.
+    5. ``GPFRun.collapse_redundant_components`` calls ``mask_component`` on duplicates
+       found in overlapping windows.
+    6. ``set_ms1_features`` attaches MS1 features whose isotopes fall in the isolation
+       window, interpolated onto this window's retention times.
+    7. ``set_ms1_ms2_feature_matches`` stores the regression of each component's
+       elution profile onto the MS1 feature profiles.
+    8. ``dump_h5``/``from_h5`` save and restore all of the above (lazy mode reloads
+       windows from HDF5 between stages).
+
+    How the m/z arrays and masks relate:
+
+    - ``_mz_bin_indices_unfilter``/``_mz_unfilter`` list every bin of the GPF (the
+      columns of ``_m_unfilter``). ``_mz_masked`` is aligned with them and is True
+      for bins removed by filtering.
+    - ``_mz_bin_indices``/``_mz`` list the bins that survived filtering, i.e. the
+      columns of ``_m`` and ``_h``. They equal the unfiltered arrays at
+      ``~_mz_masked`` (bin indices are sorted, so ``np.searchsorted`` maps between
+      them).
+    - ``_m_max`` holds the per-bin maximum used for max-scaling and
+      ``_m_max_bin_indices`` the bins it was computed for (bins still present at
+      scaling time). ``reverse_transform_maxscale_scans`` looks up the current bins
+      in it to turn H back into intensity units.
+
+    How components are selected:
+
+    - ``_non_zero_components``: NMF columns of W that aren't all zero.
+    - ``_component_keep``: starts equal to ``_non_zero_components``. Set False for
+      failed/edge Gaussian fits and for duplicates masked during collapse.
+    - ``component_indices`` = where both are True. The ``w``, ``h``,
+      ``component_names``, ``component_fit_parameters`` and ``component_maes``
+      properties all return only these components. The underscore arrays keep all
+      ``n_components`` columns/rows, indexed by the original component number.
 
     Attributes:
         _scan_number (np.ndarray): Array of scan numbers.
@@ -41,6 +97,8 @@ class ScanWindow:
         _is_ms1_features_fit (bool): Whether MS1 features have been fit to MS2 components.
     """
 
+    # Processing switches for filter_scans. These are class-level defaults, not part of
+    # Config, but they are saved per window in h5 and restored by from_h5.
     _filter_edge_nscans = 5
     _denoise_scans = True
     _scale_scans = True
@@ -53,6 +111,7 @@ class ScanWindow:
     _downcast_scans = True
     _downcast_bins = True
 
+    # NMF results (set_nmf_fit).
     _w = None
     _h = None
     _nmf_reconstruction_error = None
@@ -60,12 +119,15 @@ class ScanWindow:
     _component_keep = None
     _is_fit = False
 
+    # Gaussian fits of each component's elution profile (set_peak_fits).
     _component_means = None
     _component_sigmas = None
     _component_maes = None
     _component_names = None
     _is_component_fit = False
 
+    # MS1 features (set_ms1_features) and MS1-MS2 matches
+    # (set_ms1_ms2_feature_matches).
     _ms1_features = None
     _component_ms1_coef_matrix = None
     _component_ms1_global_exp_var = None
@@ -86,13 +148,20 @@ class ScanWindow:
     ):
         """Initialize a ScanWindow instance.
 
+        Nothing is filtered yet: the filtered copies (``_m``, ``_mz``,
+        ``_mz_bin_indices``) start equal to the unfiltered inputs and ``_mz_masked``
+        is all False.
+
         Args:
-            gpf (float): Gas Phase Fractionation value.
-            m (scipy.sparse.csr_matrix): Sparse intensity matrix.
-            scan_number (np.ndarray): Array of scan numbers.
-            bin_indices (np.ndarray): Array of bin indices.
-            retention_time (np.ndarray): Array of retention times.
-            mz (np.ndarray): Array of m/z values.
+            gpf (float): Gas Phase Fractionation value (isolation window target m/z).
+            m (scipy.sparse.csr_matrix): Sparse intensity matrix, scans x m/z bins.
+            scan_number (np.ndarray): Scan number of each row.
+            scan_index (np.ndarray): Index of each row within the GPF run (0-based).
+            bin_indices (np.ndarray): Global m/z bin index of each column (sorted).
+            retention_time (np.ndarray): Retention time of each row.
+            mz (np.ndarray): m/z value (bin right edge) of each column.
+            gpf_low (Optional[float]): Lower isolation bound, if known.
+            gpf_high (Optional[float]): Upper isolation bound, if known.
         """
         self._scan_number = scan_number
         self._scan_index = scan_index
@@ -307,6 +376,10 @@ class ScanWindow:
     def ms1_features_information(self) -> Tuple[np.ndarray, np.ndarray]:
         """Get interpolated intensities and IDs for all MS1 features.
 
+        Each column is one feature's hill interpolated onto this window's retention
+        times (see ``MS1Feature.interpolate_onto_ms2``). This is the design matrix that
+        MS1-MS2 matching regresses each component's elution profile onto.
+
         Returns:
             Tuple[np.ndarray, np.ndarray]: Tuple containing:
                 - 2D array of interpolated intensities (scans × features)
@@ -318,6 +391,9 @@ class ScanWindow:
         if self._ms1_features is None:
             raise AttributeError("No ms1 features added to this scanwindow.")
 
+        # No features attached: return an empty matrix and no IDs. Note the transpose
+        # gives shape (0, n_scans), not (n_scans, 0); matching still works because
+        # every feature mask built from it ends up empty.
         if len(self._ms1_features) == 0:
             return (
                 np.empty(
@@ -329,6 +405,7 @@ class ScanWindow:
                 np.array([]),
             )
 
+        # Stack the per-feature profiles as columns: scans x features.
         ms1_elution = np.vstack(
             [f._interpolated_intensity for f in self._ms1_features]
         ).T
@@ -349,8 +426,13 @@ class ScanWindow:
     def mask_component(self, component_index) -> None:
         """Mask/exclude a component from further analysis.
 
+        Used by ``GPFRun.collapse_redundant_components`` to drop a duplicate of a
+        component found in an overlapping window. The component stays in ``_w``/``_h``
+        but disappears from ``component_indices`` and every property built on it.
+
         Args:
-            component_index (int): Index of component to mask
+            component_index (int): Original component number (column of ``_w``), not a
+                position within ``component_indices``.
 
         Raises:
             AttributeError: If peak fitting has not been performed
@@ -371,22 +453,38 @@ class ScanWindow:
         - Denoising (if enabled)
         - Edge scan filtering (if enabled)
         - Downcasting data types (if enabled)
+
+        Every step that can empty a bin ends with ``filter_zero_mz``, so ``_m`` only
+        ever has columns with some signal. ``_m`` keeps its storage type: a window
+        sliced from a GPFRun stays a CSR matrix (denoising densifies temporarily and
+        converts back), and the ``m`` property returns it dense for NMF.
         """
+        # 1. Drop bins with no signal in this window.
         self.filter_zero_mz()
+        # 2. Drop bins whose signal is roughly constant over the window (background,
+        #    contaminants): they carry no elution information.
         self.filter_clip_constant()
+        # 3. Zero out the weakest values (below a percentile of non-zero intensities).
         if self._percentile_filter_scans:
             self.filter_percentile_scans()
+        # 4. Optional log transform (off by default).
         if self._log_scans:
             self.transform_log_scans()
+        # 5. Scale each bin to max 1, so weak and strong fragments weigh alike in NMF.
         if self._scale_scans:
             self.transform_maxscale_scans()
+        # 6. Morphological denoising along time to remove single-scan spikes.
         if self._denoise_scans:
             self.filter_denoise_scans()
+        # 7. Zero the first/last few scans; components peaking there are cut off.
         if self._filter_edge_scans:
             self.filter_edge_scans()
+        # 8. Downcast intensities.
         if self._downcast_scans:
             # Push through downcast to make results reproducible if ran through h5
-            # intermediate or not.
+            # intermediate or not. dump_h5 stores the matrix as float16, so rounding
+            # through float16 here makes in-memory and reloaded runs see the same
+            # values.
             if self._downcast_h5:
                 self._m = self._m.astype(np.float16)
             self._m = self._m.astype(np.float32)
@@ -404,9 +502,16 @@ class ScanWindow:
     def filter_mz_axis(self, mask: np.ndarray) -> None:
         """Filter the m/z axis using a boolean mask.
 
+        Removes columns from the filtered arrays (``_m``, ``_mz``, ``_mz_bin_indices``)
+        and records the removed bins in ``_mz_masked``, which is aligned with the
+        unfiltered bins.
+
         Args:
-            mask (np.ndarray): Boolean mask indicating which m/z values to keep.
+            mask (np.ndarray): Boolean mask over the *current* filtered columns
+                indicating which m/z values to keep.
         """
+        # Map the removed bins back to their positions in the unfiltered bin list
+        # (both lists are sorted) and flag them.
         self._mz_masked[
             np.searchsorted(
                 self._mz_bin_indices_unfilter,
@@ -419,8 +524,14 @@ class ScanWindow:
 
     def filter_edge_scans(self) -> None:
         """Filter out edge scans by setting their intensities to zero.
-        Uses _filter_edge_nscans to determine number of scans to filter.
+
+        Uses _filter_edge_nscans to determine number of scans to filter. Overlapping
+        windows cover these scans in their interior, so nothing is lost; it stops NMF
+        from fitting peaks that are cut off at the window edge. ``set_peak_fits`` later
+        drops components whose fitted peak reaches into this zone.
         """
+        # Warnings silenced: assigning into a CSR matrix raises
+        # SparseEfficiencyWarning.
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             self._m[: self._filter_edge_nscans, :] = 0.0
@@ -430,6 +541,7 @@ class ScanWindow:
     def filter_zero_mz(self) -> None:
         """Remove m/z values that have zero intensity across all scans."""
         mask = (self._m.sum(axis=0) > 0.0).flatten()
+        # Column sums of a sparse matrix come back as a 1 x n np.matrix.
         if isinstance(mask, np.matrix):
             mask = np.array(mask).flatten()
         self.filter_mz_axis(mask)
@@ -441,6 +553,12 @@ class ScanWindow:
         robust_scaling_percentile: float = 99.5,
     ) -> None:
         """Scale intensities by maximum value along specified axis.
+
+        With the default ``axis=0`` each m/z bin is divided by its maximum over the
+        window, so every fragment trace peaks at 1. Without this, NMF would mostly fit
+        the few most intense fragments. The factors are kept in ``_m_max`` (with the
+        bins they belong to in ``_m_max_bin_indices``) so exported spectra can be put
+        back into intensity units (``reverse_transform_maxscale_scans``).
 
         Args:
             axis (int): Axis along which to find maximum (0=scans, 1=m/z)
@@ -456,12 +574,17 @@ class ScanWindow:
                 axis=axis,
                 method="lower",
             )
+        # Sparse max() returns a sparse 1 x n matrix; flatten it to a 1-D array.
         if not isinstance(m_m, np.ndarray):
             m_m = m_m.toarray().flatten()
+        # Row-wise scaling needs a column vector to broadcast.
         if axis == 1:
             m_m = m_m[..., np.newaxis]
+        # Remember the factors and the bins they were computed for, since later
+        # filters can still remove bins.
         self._m_max = m_m
         self._m_max_bin_indices = self._mz_bin_indices.copy()
+        # Sparse matrices divide via multiply() to stay sparse.
         if not isinstance(self._m, (np.ndarray, np.matrix)):
             self._m = self._m.multiply(1.0 / m_m)
         else:
@@ -472,7 +595,14 @@ class ScanWindow:
         self._m = np.log1p(self._m)
 
     def filter_percentile_scans(self) -> None:
-        """Filter out low intensity values below specified percentile threshold."""
+        """Filter out low intensity values below specified percentile threshold.
+
+        The threshold is the ``_percentile_filter`` percentile (default 10) of the
+        non-zero intensities in the window. Values below it are set to zero, then
+        bins left empty are dropped.
+        """
+        # Percentile over non-zero values only (a sparse matrix's .data already
+        # holds just the stored non-zeros).
         if isinstance(self._m, np.ndarray):
             threshold_signal = np.percentile(
                 self._m.flatten()[self._m.flatten() > 0],
@@ -482,15 +612,29 @@ class ScanWindow:
             threshold_signal = np.percentile(self._m.data, self._percentile_filter)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            self._m[self._m < threshold_signal] = 0.0
+            if isinstance(self._m, np.ndarray):
+                self._m[self._m < threshold_signal] = 0.0
+            else:
+                # Edit the stored values directly. Boolean-mask assignment on a sparse
+                # matrix inserts entries one at a time and re-sorts the indices, which
+                # made this the slowest step of building the run.
+                self._m = self._m.tocsr()
+                self._m.data[self._m.data < threshold_signal] = 0.0
+                self._m.eliminate_zeros()
         self.filter_zero_mz()
 
     def filter_clip_constant(self, p: float = 0.3) -> None:
         """Remove m/z values with constant signal above threshold.
 
+        Each bin is divided by its own maximum and averaged over the window's scans.
+        A real eluting fragment is near zero most of the time, so its mean is low. A
+        bin whose mean exceeds ``p`` is present at a large fraction of its maximum
+        across the window (background ions, contaminants) and is removed.
+
         Args:
             p (float): Threshold for mean normalized intensity
         """
+        # Keep bins with mean(normalized intensity) <= p.
         if isinstance(self._m, np.ndarray):
             mask = ~(((self._m / self._m.max(axis=0)).mean(axis=0)) > p)
         else:
@@ -506,6 +650,16 @@ class ScanWindow:
     ) -> np.ndarray:
         """Apply operations to denoise scan data.
 
+        Works along the time axis only (structuring elements are ``(size, 1)``, so
+        each m/z bin is treated separately):
+
+        - grey closing (dilation then erosion) fills one-scan dropouts inside a peak;
+        - grey erosion then removes features narrower than the element, such as
+          single-scan noise spikes.
+
+        Updates ``_m`` in place; the docstring's return value is not used (the method
+        returns None).
+
         Args:
             grey_erosion_size (int): Size of structuring element for grey erosion
             grey_closing_size (int): Size of structuring element for grey closing
@@ -513,6 +667,7 @@ class ScanWindow:
         Returns:
             np.ndarray: Denoised scan data
         """
+        # scipy.ndimage needs a dense array; convert back afterwards if sparse.
         is_sparse = False
         if not isinstance(self._m, (np.ndarray, np.matrix)):
             is_sparse = True
@@ -531,8 +686,12 @@ class ScanWindow:
     def reverse_transform_maxscale_scans(self) -> np.ndarray:
         """Reverse the max scaling transformation previously applied to scans.
 
+        Looks up the scaling factor of every current (filtered) bin. Multiplying a row
+        of ``h`` by the result gives the component spectrum in intensity units.
+
         Returns:
-            np.ndarray: Array of scale factors to reverse the transformation
+            np.ndarray: Array of scale factors to reverse the transformation, aligned
+                with ``mz_bin_indices``
 
         Raises:
             AttributeError: If max scale factors were not previously computed
@@ -550,14 +709,28 @@ class ScanWindow:
     def unfiltered_with_filter(self, scale_if_exists: bool = True) -> np.ndarray:
         """Get unfiltered data with filtering mask applied.
 
+        Returns the original intensities (before percentile filtering, denoising and
+        edge zeroing) for the bins that survived filtering, optionally max-scaled
+        with the same factors as ``_m``. This needs ``_m_unfilter`` to still span all
+        GPF bins, which isn't the case after reloading from h5 unless
+        ``scan_window_save_m_unfilter`` was set.
+
         Args:
             scale_if_exists (bool): Whether to apply scaling if max scale factors exist
 
         Returns:
             np.ndarray: Filtered unfiltered data matrix
         """
-        m = self._mz_bin_indices_unfilter[:, ~self._mz_masked].toarray()
-        if scale_if_exists and self._m_max:
+        # After a reload without m_unfilter, _m_unfilter is a copy of the filtered
+        # matrix and no longer lines up with _mz_masked.
+        if self._m_unfilter.shape[1] != self._mz_masked.shape[0]:
+            raise ValueError(
+                "Unfiltered matrix not available (it isn't saved to h5 by default)."
+            )
+        m = self._m_unfilter[:, ~self._mz_masked]
+        if not isinstance(m, np.ndarray):
+            m = m.toarray()
+        if scale_if_exists and self._m_max is not None:
             scale_indices = np.searchsorted(
                 self._m_max_bin_indices,
                 self._mz_bin_indices,
@@ -568,29 +741,32 @@ class ScanWindow:
     def set_nmf_fit(self, w: np.ndarray, h: np.ndarray, model: NMF) -> None:
         """Set NMF decomposition results.
 
+        A refit replaces any previous fit. Peak fits and MS1 matches belong to the
+        previous components, so they are reset and need to be recomputed.
+
         Args:
-            w (np.ndarray): NMF basis matrix
-            h (np.ndarray): NMF coefficient matrix
+            w (np.ndarray): NMF basis matrix, scans x components (elution profiles)
+            h (np.ndarray): NMF coefficient matrix, components x filtered bins
+                (component spectra in max-scaled units)
             model (NMF): Fitted NMF model object containing reconstruction error
         """
+        # Results derived from the old components no longer apply.
         if self.is_fit:
-            self._w = np.hstack([self._w, w.copy()])
-            self._h = np.vstack([self._h, h.copy()])
-            self._nmf_reconstruction_error = np.concatenate(
-                [self._nmf_reconstruction_error, model._reconstruction_err_]
-            )
-            self._non_zero_components = np.concatenate(
-                [self._non_zero_components, w.sum(axis=0) != 0.0]
-            )
-            component_keep = np.zeros(w.shape[1], dtype=bool)
-            component_keep = component_keep[w.sum(axis=0) != 0.0]
-            self._component_keep = np.concatenate(
-                [self._component_keep, component_keep]
-            )
+            self._component_means = None
+            self._component_sigmas = None
+            self._component_maes = None
+            self._component_names = None
+            self._is_component_fit = False
+            self._component_ms1_coef_matrix = None
+            self._component_ms1_global_exp_var = None
+            self._component_ms1_individual_exp_var = None
+            self._is_ms1_features_fit = False
 
         self._w = w.copy()
         self._h = h.copy()
         self._nmf_reconstruction_error = model.reconstruction_err_
+        # Regularization can switch components off entirely (all-zero W column);
+        # only the non-zero ones are kept.
         self._non_zero_components = self._w.sum(axis=0) != 0.0
         self._component_keep = np.zeros(self._w.shape[1], dtype=bool)
         self._component_keep[self._non_zero_components] = True
@@ -601,12 +777,20 @@ class ScanWindow:
     ) -> None:
         """Set peak fitting results for components.
 
+        The inputs are aligned with the non-zero components (the order
+        ``fit_scanwindow`` iterates in) and are scattered into arrays over all
+        components. Components that failed to fit, or whose peak (mean +/- 2 sigma)
+        reaches into the zeroed edge scans, are marked not kept. Also builds each
+        component's name.
+
         Args:
-            m (np.ndarray): Peak means/centers
-            s (np.ndarray): Peak standard deviations/widths
+            m (np.ndarray): Peak means/centers (retention time units)
+            s (np.ndarray): Peak standard deviations/widths (retention time units)
             maes (np.ndarray): Mean absolute errors of peak fits
             keep (np.ndarray): Boolean mask of peaks to keep
         """
+        # Scatter per-non-zero-component results into full-length arrays; zero-weight
+        # components get mean/sigma/mae 0.
         self._component_keep[self._non_zero_components] = keep.copy()
         self._component_means = np.zeros(self._w.shape[1])
         self._component_means[self._non_zero_components] = m.copy()
@@ -615,7 +799,8 @@ class ScanWindow:
         self._component_maes = np.zeros(self._w.shape[1])
         self._component_maes[self._non_zero_components] = maes.copy()
 
-        # Filter fits that are within 2s of clipped edge.
+        # Filter fits that are within 2s of clipped edge. Those peaks are truncated in
+        # this window; an overlapping window sees them whole.
         if self._filter_edge_scans:
             mask = (
                 self.retention_time[self._filter_edge_nscans]
@@ -625,6 +810,8 @@ class ScanWindow:
                 < (self._component_means + 2 * self._component_sigmas)
             )
             self._component_keep[mask] = False
+        # Name = "<gpf>_<component>-<scan index nearest the apex>_<mean>_<sigma>",
+        # unique within a run. Built for every component, kept or not.
         self._component_names = np.array(
             [
                 (
@@ -642,6 +829,8 @@ class ScanWindow:
         self, value: str, by: Literal["name"] = "name"
     ) -> List[Dict[str, Any]]:
         """Query information about components.
+
+        Not implemented yet: returns one empty dict per matching component.
 
         Args:
             value (str): Value to query for
@@ -666,6 +855,10 @@ class ScanWindow:
     def set_ms1_features(self, ms1_features: List[MS1Feature]) -> None:
         """Set MS1 features associated with this scan window.
 
+        Replaces any previous list. Features are expected to be interpolated onto
+        this window's retention times already (``add_ms1_features_scanwindow`` does
+        this).
+
         Args:
             ms1_features (List[MS1Feature]): List of MS1 features to associate
         """
@@ -679,10 +872,16 @@ class ScanWindow:
     ) -> None:
         """Set results from matching MS1 features to MS2 components.
 
+        Rows follow ``component_indices`` (kept components at matching time) and
+        columns follow ``ms1_features``.
+
         Args:
             coef_matrix (np.ndarray): Matrix of coefficients relating MS1 to MS2 features
+                (kept components x MS1 features)
             global_variance_explained (np.ndarray): Global explained variance for MS1-MS2 matches
+                (one value per kept component)
             individual_variance_explained (np.ndarray): Individual explained variance for each match
+                (kept components x MS1 features)
         """
         self._component_ms1_coef_matrix = coef_matrix.copy()
         self._component_ms1_global_exp_var = global_variance_explained.copy()
@@ -695,15 +894,33 @@ class ScanWindow:
         dataset_name: str = "scan_window",
         save_m_unfilter: bool = True,
         mode: Literal["write", "update"] = "write",
+        compact: bool = False,
+        compression: Optional[str] = None,
     ) -> None:
         """Save the ScanWindow object to an HDF5 file or group.
+
+        Layout of the group: scalar flags and bounds as attributes; index/m/z arrays,
+        the filtered matrix (``m`` dense, or ``m_data``/``m_indices``/``m_indptr`` +
+        ``m_shape`` attribute when sparse), NMF results, peak fits, MS1 features (one
+        subgroup each under ``ms1_features``) and MS1-MS2 matches as datasets.
+
+        In "update" mode (used by lazy MSRuns after every pipeline stage) the existing
+        group is reused and each dataset is only rewritten when its contents changed,
+        which avoids rewriting the large matrices on every stage.
 
         Args:
             h5file (Union[str, h5py.File, h5py.Group]): Path to HDF5 file or h5py File/Group object
             dataset_name (str): Name of the dataset/group to store the object
             save_m_unfilter (bool): Whether to save unfiltered matrix data
             mode (Literal["write", "update"]): Whether to overwrite ("write") or update existing data
+            compact (bool): Don't store the unfiltered m/z axis (``mz_unfilter``,
+                ``mz_bin_indices_unfilter``, ``mz_masked``). It is the parent GPFRun's
+                bin axis, so ``from_h5`` rebuilds it exactly from the GPFRun. The group
+                is marked with the ``compact_axes`` attribute.
+            compression (Optional[str]): h5py compression filter for the datasets
+                (lossless), or None.
         """
+        # Open (or create) the target group. "update" reuses an existing group.
         if isinstance(h5file, str):
             f = h5py.File(h5file, "r+" if mode == "update" else "w")
             if mode == "update" and dataset_name in f:
@@ -754,6 +971,9 @@ class ScanWindow:
             if isinstance(data, sps.csr_matrix):
                 # For sparse matrices
                 if mode == "update":
+                    # Stored values are float16 (see below), so compare after the
+                    # same cast. filter_scans already rounds _m through float16, so
+                    # an unchanged matrix compares equal and isn't rewritten.
                     data_changed = (
                         f"{name}_data" not in grp
                         or not np.array_equal(
@@ -773,26 +993,33 @@ class ScanWindow:
                     if f"{name}{suffix}" in grp:
                         del grp[f"{name}{suffix}"]
 
-                # Create new datasets
-                grp.create_dataset(
+                # Create new datasets. Values are stored as float16 to halve the file
+                # size when _downcast_h5 is set.
+                create_dataset(
+                    grp,
                     f"{name}_data",
-                    data=(
+                    (
                         data.data
                         if not self._downcast_h5
                         else data.data.astype(np.float16)
                     ),
+                    compression=compression,
                 )
-                grp.create_dataset(f"{name}_indices", data=data.indices)
-                grp.create_dataset(f"{name}_indptr", data=data.indptr)
+                create_dataset(
+                    grp, f"{name}_indices", data.indices, compression=compression
+                )
+                create_dataset(
+                    grp, f"{name}_indptr", data.indptr, compression=compression
+                )
                 grp.attrs[f"{name}_shape"] = data.shape
             else:
-                # For regular arrays
+                # For regular arrays (dense arrays are stored at full precision)
                 if mode == "update":
                     if name in grp and check_arrays_equal(data, grp[name][:]):
                         return
                 if name in grp:
                     del grp[name]
-                grp.create_dataset(name, data=data)
+                create_dataset(grp, name, data, compression=compression)
 
         # Save/update scalar attributes
         scalar_attrs = (
@@ -806,6 +1033,8 @@ class ScanWindow:
 
         for sa in scalar_attrs:
             v = getattr(self, f"_{sa}", -1)
+            # h5py can't store None, from_h5 maps -1 back to None.
+            v = -1 if v is None else v
             if mode == "write" or sa not in grp.attrs or grp.attrs[sa] != v:
                 grp.attrs[sa] = v
 
@@ -821,11 +1050,26 @@ class ScanWindow:
             "mz_bin_indices",
         )
 
+        # The unfiltered axis of a window is its GPFRun's full bin axis, the same for
+        # every window of the GPF. Compact mode stores only the dtypes needed to
+        # rebuild it exactly (see from_h5); otherwise every window keeps a copy.
+        gpf_axis_datasets = ("mz_masked", "mz_unfilter", "mz_bin_indices_unfilter")
+        grp.attrs["compact_axes"] = compact
+        if compact:
+            grp.attrs["mz_unfilter_dtype"] = str(self._mz_unfilter.dtype)
+            grp.attrs["mz_bin_indices_unfilter_dtype"] = str(
+                self._mz_bin_indices_unfilter.dtype
+            )
+
         for ds in array_datasets:
+            if compact and ds in gpf_axis_datasets:
+                save_dataset(ds, None)  # Removes a copy left by a non-compact write.
+                continue
             if hasattr(self, f"_{ds}"):
                 save_dataset(ds, getattr(self, f"_{ds}", None))
 
-        # Save sparse intensity matrix, or if dense.
+        # Save sparse intensity matrix, or if dense. m_is_sparse tells from_h5 which
+        # layout to read back.
         if isinstance(self._m, (np.ndarray, np.matrix)):
             save_dataset("m", self._m)
             grp.attrs["m_is_sparse"] = False
@@ -834,10 +1078,12 @@ class ScanWindow:
             grp.attrs["m_is_sparse"] = True
 
         if save_m_unfilter:
-            # Save unfiltered sparse matrix
+            # Save unfiltered sparse matrix. Off by default (h5.scan_window_save_
+            # m_unfilter) because it holds every GPF bin for every window.
             save_dataset("m_unfilter", self._m_unfilter)
 
-        # Save NMF results if they exist
+        # Save NMF results if they exist. W/H keep all components; component_keep
+        # carries the collapse masks.
         if self._is_fit and hasattr(self, "_w"):
             nmf_arrays = (
                 "w",
@@ -867,13 +1113,25 @@ class ScanWindow:
         # Need to check and update MS1 features here.
         # Save MS1 features if they exist
         if self._ms1_features is not None:
-            # If the group exists, delete group and re-add.
-            if "ms1_features" in grp:
-                del grp["ms1_features"]
+            # If the group exists, delete group and re-add (features aren't compared,
+            # so they are rewritten on every dump).
+            for old in ("ms1_features", "ms1_feature_table"):
+                if old in grp:
+                    del grp[old]
 
-            ms1_grp = grp.create_group("ms1_features")
-            for i, feature in enumerate(self._ms1_features):
-                feature.dump_h5(ms1_grp, f"feature_{i}")
+            # Compact storage keeps all features in one table (few HDF5 objects);
+            # it falls back to one group per feature if that can't be exact.
+            stored_as_table = compact and dump_ms1_feature_table(
+                grp,
+                "ms1_feature_table",
+                self._ms1_features,
+                self._retention_time,
+                compression=compression,
+            )
+            if not stored_as_table:
+                ms1_grp = grp.create_group("ms1_features")
+                for i, feature in enumerate(self._ms1_features):
+                    feature.dump_h5(ms1_grp, f"feature_{i}")
 
         if self._is_ms1_features_fit:
             save_dataset("component_ms1_coef_matrix", self._component_ms1_coef_matrix)
@@ -886,7 +1144,8 @@ class ScanWindow:
             )
             grp.attrs["is_ms1_features_fit"] = self._is_ms1_features_fit
 
-        # Save class-level configuration attributes
+        # Save class-level configuration attributes, so a reloaded window remembers
+        # how it was filtered.
         grp.attrs["filter_edge_nscans"] = self._filter_edge_nscans
         grp.attrs["denoise_scans"] = self._denoise_scans
         grp.attrs["scale_scans"] = self._scale_scans
@@ -898,7 +1157,7 @@ class ScanWindow:
         grp.attrs["downcast_scans"] = self._downcast_scans
         grp.attrs["downcast_bins"] = self._downcast_bins
 
-        # Save m_max data if it exists
+        # Save m_max data if it exists (needed to reverse the max-scaling on export).
         if self._m_max is not None:
             save_dataset("m_max", self._m_max)
             save_dataset("m_max_bin_indices", self._m_max_bin_indices)
@@ -915,15 +1174,28 @@ class ScanWindow:
         cls,
         h5file: Union[str, h5py.File, h5py.Group],
         dataset_name: str = "scan_window",
+        gpf_bin_indices: Optional[np.ndarray] = None,
+        gpf_mz: Optional[np.ndarray] = None,
     ) -> "ScanWindow":
         """Load a ScanWindow object from an HDF5 file or group.
+
+        Inverse of ``dump_h5``. If ``m_unfilter`` wasn't saved, ``_m_unfilter`` is set
+        to a copy of the filtered matrix (so ``unfiltered_with_filter`` can't be used).
 
         Args:
             h5file (Union[str, h5py.File, h5py.Group]): Path to HDF5 file or h5py File/Group object
             dataset_name (str): Name of the dataset/group containing the object
+            gpf_bin_indices (Optional[np.ndarray]): The parent GPFRun's bin axis.
+                Required for windows written with ``compact=True``.
+            gpf_mz (Optional[np.ndarray]): m/z of each bin in ``gpf_bin_indices``.
+                Required for windows written with ``compact=True``.
 
         Returns:
             ScanWindow: Loaded object
+
+        Raises:
+            ValueError: If the window was written in compact mode and the parent
+                GPFRun's axis isn't given.
         """
         if isinstance(h5file, str):
             f = h5py.File(h5file, "r")
@@ -933,7 +1205,7 @@ class ScanWindow:
             grp = h5file[dataset_name]
             close_file = False
 
-        # Load sparse matrix
+        # Load sparse matrix (stored as float16, promoted back to float32)
         if grp.attrs["m_is_sparse"]:
             _m = sps.csr_matrix(
                 (
@@ -959,7 +1231,8 @@ class ScanWindow:
         else:
             m = _m.copy()
 
-        # Create instance
+        # Create instance. The constructor gets the filtered bins/m/z; the unfiltered
+        # arrays and the mask are restored right after.
         obj = cls(
             gpf=grp.attrs["gpf"],
             m=m,
@@ -972,10 +1245,25 @@ class ScanWindow:
             gpf_high=None if grp.attrs["gpf_high"] == -1 else grp.attrs["gpf_high"],
         )
 
-        # Restore additional attributes
-        obj._mz_masked = grp["mz_masked"][:]
-        obj._mz_unfilter = grp["mz_unfilter"][:]
-        obj._mz_bin_indices_unfilter = grp["mz_bin_indices_unfilter"][:]
+        # Restore the unfiltered axis and the mask of filtered-out bins.
+        if grp.attrs.get("compact_axes", False):
+            if gpf_bin_indices is None or gpf_mz is None:
+                raise ValueError(
+                    "Window was stored in compact mode. Load it through GPFRun.from_h5, "
+                    "or pass gpf_bin_indices and gpf_mz."
+                )
+            # The unfiltered axis is the GPF's full axis, cast back to the dtypes the
+            # window had when it was written.
+            obj._mz_bin_indices_unfilter = np.asarray(gpf_bin_indices).astype(
+                grp.attrs["mz_bin_indices_unfilter_dtype"]
+            )
+            obj._mz_unfilter = np.asarray(gpf_mz).astype(grp.attrs["mz_unfilter_dtype"])
+            # filter_mz_axis marks exactly the bins that are no longer in the window.
+            obj._mz_masked = ~np.isin(obj._mz_bin_indices_unfilter, obj._mz_bin_indices)
+        else:
+            obj._mz_masked = grp["mz_masked"][:]
+            obj._mz_unfilter = grp["mz_unfilter"][:]
+            obj._mz_bin_indices_unfilter = grp["mz_bin_indices_unfilter"][:]
 
         obj._m = _m
         obj._is_filtered = grp.attrs["is_filtered"]
@@ -996,8 +1284,13 @@ class ScanWindow:
             obj._component_maes = grp["component_maes"][:]
             obj._is_component_fit = True
 
-        # Load MS1 features if they exist
-        if "ms1_features" in grp:
+        # Load MS1 features if they exist (table layout from compact storage, or one
+        # group per feature).
+        if "ms1_feature_table" in grp:
+            obj._ms1_features = load_ms1_feature_table(
+                grp["ms1_feature_table"], obj._retention_time
+            )
+        elif "ms1_features" in grp:
             obj._ms1_features = []
             ms1_grp = grp["ms1_features"]
             for i in range(len(ms1_grp)):
@@ -1012,7 +1305,7 @@ class ScanWindow:
             ][:]
             obj._is_ms1_features_fit = grp.attrs["is_ms1_features_fit"]
 
-        # Load class-level configuration attributes
+        # Load class-level configuration attributes (as instance attributes)
         obj._filter_edge_nscans = grp.attrs["filter_edge_nscans"]
         obj._denoise_scans = grp.attrs["denoise_scans"]
         obj._scale_scans = grp.attrs["scale_scans"]
